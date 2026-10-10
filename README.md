@@ -51,6 +51,7 @@ out = net(image)                           # callable; runs on ANE silicon
 
 # ...or load a pretrained model
 enc = af.load(".../all-MiniLM-L6-v2")      # MiniLM sentence encoder
+modernbert = af.load("answerdotai/ModernBERT-base")  # ModernBERT sentence encoder
 vec = enc(tokens)                          # on-device, cosine 1.0000 vs reference
 ```
 

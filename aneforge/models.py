@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from .graph import Tensor, concat, conv, input, mha, space_to_depth, _const
+from .graph import Tensor, concat, conv, input, mha, space_to_depth, split, _const
 from .autograd import conv2d, conv_param, parameter
 from ._compile import Model, SegmentedModel, compile, compile_multi
 from . import _targets
@@ -20,9 +20,9 @@ def _l2_normalizer(D: int) -> Model | SegmentedModel:
   return net
 
 
-def load(name: str, int8: bool = False, pooling: str = "mean") -> "Encoder":
-  """Load a BERT-family sentence encoder from HF weights as an ANE embedder; `pooling` in mean/cls/max."""
-  return Encoder(name, int8=int8, pooling=pooling)
+def load(name: str, int8: bool = False, pooling: str = "mean", chunk_layers: int = 4) -> "Encoder":
+  """Load a BERT or ModernBERT encoder from HF weights; `pooling` in mean/cls/max."""
+  return Encoder(name, int8=int8, pooling=pooling, chunk_layers=chunk_layers)
 
 
 # ResNet stage layouts, straight from the torchvision factories: blocks per stage and the residual
@@ -244,20 +244,121 @@ def _encoder_layer_spec(model_type: str) -> tuple[str, dict[str, str]]:
   return "encoder.layer.{i}.", _BERT_KEYS
 
 
+def _modernbert_rope(S: int, dh: int, theta: float) -> tuple[np.ndarray, np.ndarray]:
+  inv = theta ** (-np.arange(0, dh, 2, dtype=np.float64) / dh)
+  angles = np.outer(np.arange(S, dtype=np.float64), inv)
+  angles = np.concatenate((angles, angles), axis=-1)
+  return np.cos(angles)[None].astype(np.float32), np.sin(angles)[None].astype(np.float32)
+
+
+def _modernbert_band(S: int, half_window: int) -> np.ndarray:
+  pos = np.arange(S)
+  return np.where(np.abs(pos[:, None] - pos[None, :]) > half_window, -1e4, 0).astype(np.float32)[None]
+
+
+def _modernbert_rotate(x: Tensor, cos: np.ndarray, sin: np.ndarray) -> Tensor:
+  a, b = split(x, 2, axis=-1)
+  return x * cos + concat((b * -1.0, a), axis=-1) * sin
+
+
+class _EncoderStack:
+  """Run a transformer as several compile-sized ANE programs."""
+
+  def __init__(self, nets: list[Model | SegmentedModel | _EncoderAttention | _EncoderMlp]) -> None:
+    self.nets = nets
+
+  def __call__(self, states: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    for net in self.nets: states = net(states, mask)
+    return states
+
+  def release(self) -> None:
+    for net in self.nets: net.release()
+
+
+class _EncoderAttention:
+  """Sum partial attention heads from compile-sized ANE programs."""
+
+  def __init__(self, nets: list[Model | SegmentedModel]) -> None:
+    self.nets = nets
+
+  def __call__(self, states: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    result = np.asarray(self.nets[0](states, mask), np.float32)
+    for net in self.nets[1:]: result += net(states, mask)
+    return result
+
+  def release(self) -> None:
+    for net in self.nets: net.release()
+
+
+class _EncoderMlp:
+  def __init__(self, net: Model | SegmentedModel) -> None:
+    self.net = net
+
+  def __call__(self, states: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    return self.net(states)
+
+  def release(self) -> None: self.net.release()
+
+
 class Encoder:
   _POOL = ("mean", "cls", "max")
 
-  def __init__(self, name: str, int8: bool = False, pooling: str = "mean") -> None:
+  def __init__(self, name: str, int8: bool = False, pooling: str = "mean", *,
+               state_dict=None, config=None, tokenizer=None, chunk_layers: int = 4) -> None:
     if pooling not in self._POOL:
       raise ValueError(f"pooling must be one of {self._POOL}, got {pooling!r}")
     self.pooling = pooling
     from transformers import AutoConfig, AutoModel, AutoTokenizer  # lazy
-    cfg = AutoConfig.from_pretrained(name)
-    self.tok = AutoTokenizer.from_pretrained(name)
-    sd = AutoModel.from_pretrained(name).state_dict()
-    g = lambda k: sd[k].detach().numpy().astype(np.float32)
+    laya = name == "convaiinnovations/laya"
+    backbone = "answerdotai/ModernBERT-large" if laya else name
+    cfg = config if config is not None else AutoConfig.from_pretrained(backbone)
+    self.tok = tokenizer if tokenizer is not None else AutoTokenizer.from_pretrained(backbone)
+    if state_dict is not None:
+      sd = state_dict
+    elif laya:
+      from huggingface_hub import hf_hub_download
+      from safetensors.torch import load_file
+      sd = load_file(hf_hub_download(name, "model.safetensors"))
+    else:
+      sd = AutoModel.from_pretrained(name).state_dict()
+    g = lambda k: np.asarray(sd[k].detach().cpu() if hasattr(sd[k], "detach") else sd[k], dtype=np.float32)
+    self.modernbert = cfg.model_type == "modernbert"
     self.D, self.H = cfg.hidden_size, cfg.num_attention_heads
-    self.L, self.eps, self.int8 = cfg.num_hidden_layers, cfg.layer_norm_eps, int8
+    self.L = cfg.num_hidden_layers
+    self.eps = getattr(cfg, "norm_eps", getattr(cfg, "layer_norm_eps", 1e-5))
+    self.int8 = int8
+    if chunk_layers < 1: raise ValueError("chunk_layers must be positive")
+    self.chunk_layers = chunk_layers
+    self._cache: dict[int, Model | SegmentedModel | _EncoderStack] = {}
+    if self.modernbert:
+      prefix = "encoder." if "encoder.embeddings.tok_embeddings.weight" in sd else ""
+      self.word = g(prefix + "embeddings.tok_embeddings.weight")
+      self.eln_w = g(prefix + "embeddings.norm.weight")
+      self.final_w = g(prefix + "final_norm.weight")
+      self.layer_types = list(getattr(cfg, "layer_types", ["full_attention" if i % cfg.global_attn_every_n_layers == 0
+                                                       else "sliding_attention" for i in range(self.L)]))
+      self.half_window = int(cfg.local_attention) // 2
+      rope_cfg = getattr(cfg, "rope_parameters", None) or {}
+      self.rope_theta = {}
+      for kind, attr, default in (("full_attention", "global_rope_theta", 160000.0),
+                                  ("sliding_attention", "local_rope_theta", 10000.0)):
+        params = rope_cfg.get(kind, {})
+        theta = params.get("rope_theta") if isinstance(params, dict) else None
+        self.rope_theta[kind] = float(theta or rope_cfg.get("rope_theta") or getattr(cfg, attr, default))
+      self.layers = []
+      for i in range(self.L):
+        p = f"{prefix}layers.{i}."
+        w = {k: g(p + v) for k, v in {
+          "Wqkv": "attn.Wqkv.weight", "Wo": "attn.Wo.weight",
+          "Wi": "mlp.Wi.weight", "Wd": "mlp.Wo.weight", "mlp_norm": "mlp_norm.weight",
+        }.items()}
+        if i: w["attn_norm"] = g(p + "attn_norm.weight")
+        for k, v in (("bqkv", "attn.Wqkv.bias"), ("bo", "attn.Wo.bias"),
+                     ("bi", "mlp.Wi.bias"), ("bd", "mlp.Wo.bias")):
+          if p + v in sd: w[k] = g(p + v)
+        self.layers.append(w)
+      self.rel_bias = None
+      return
     mpnet = cfg.model_type == "mpnet"
     keys = _MPNET_KEYS if mpnet else _BERT_KEYS
     self.word = g("embeddings.word_embeddings.weight")
@@ -273,9 +374,10 @@ class Encoder:
     offset_pos = cfg.model_type in ("mpnet", "roberta", "xlm-roberta", "camembert")
     self.pos_offset = int(cfg.pad_token_id) + 1 if offset_pos else 0
     self._bias_cache: dict[int, np.ndarray] = {}
-    self._cache: dict[int, Model | SegmentedModel] = {}
 
-  def _build(self, S: int) -> Model | SegmentedModel:
+  def _build(self, S: int) -> Model | SegmentedModel | _EncoderStack:
+    if self.modernbert:
+      return self._build_modernbert(S)
     h = input((S, self.D))
     mh = self.H if self.rel_bias is not None else 1   # MPNet folds a per-head relative bias into the mask
     m = input((mh, S, S))                    # additive key-padding mask: 0 on real keys, -1e4 on padded ones
@@ -286,13 +388,88 @@ class Encoder:
       h = (h + ff).layer_norm(w["ln2w"], w["ln2b"], self.eps)
     return compile(h, int8=self.int8)
 
+  def _build_modernbert(self, S: int) -> _EncoderStack:
+    nets = []
+    if self.D >= 1024:
+      for i in range(self.L):
+        groups = [self._build_modernbert_chunk(S, i, i + 1, part="attention",
+                                               head_start=h, head_stop=min(h + 8, self.H))
+                  for h in range(0, self.H, 8)]
+        nets.append(_EncoderAttention(groups))
+        nets.append(_EncoderMlp(self._build_modernbert_chunk(S, i, i + 1, part="mlp")))
+    else:
+      for start in range(0, self.L, self.chunk_layers):
+        nets.append(self._build_modernbert_chunk(S, start, min(start + self.chunk_layers, self.L)))
+    return _EncoderStack(nets)
+
+  def _build_modernbert_chunk(self, S: int, start: int, stop: int,
+                              part: str = "both", head_start: int = 0,
+                              head_stop: int | None = None) -> Model | SegmentedModel:
+    D, dh = self.D, self.D // self.H
+    last_head = self.H if head_stop is None else head_stop
+    H = last_head - head_start
+    h = input((S, D))
+    pad = input((1, S, S))
+    local_mask = pad + _modernbert_band(S, self.half_window)
+    tables = {kind: _modernbert_rope(S, dh, theta) for kind, theta in self.rope_theta.items()}
+    zeros = np.zeros(D, np.float32)
+    for i in range(start, stop):
+      w = self.layers[i]
+      if part != "mlp":
+        x = h if i == 0 else h.layer_norm(w["attn_norm"], zeros, self.eps)
+        qkv = w["Wqkv"]
+        bias = w.get("bqkv")
+        heads = [x.linear(qkv[j*D+head_start*dh:j*D+last_head*dh],
+                          None if bias is None else bias[j*D+head_start*dh:j*D+last_head*dh])
+                 .reshape(S, H, dh).transpose((1, 0, 2)) for j in range(3)]
+        q, k, v = heads
+        kind = self.layer_types[i]
+        cos, sin = tables[kind]
+        q, k = _modernbert_rotate(q, cos, sin), _modernbert_rotate(k, cos, sin)
+        mask = pad if kind == "full_attention" else local_mask
+        from .graph import _tiled_attention
+        from ._optimize import attention_tiles
+        n_tiles = attention_tiles(S, H, dh)
+        attn = _tiled_attention(q, k.transpose((0, 2, 1)), v, dh ** -0.5, n_tiles, seq_axis=1, mask=mask)
+        out = attn.transpose((1, 0, 2)).reshape(S, H * dh).linear(
+          w["Wo"][:, head_start*dh:last_head*dh], w.get("bo") if head_start == 0 else None)
+        h = h + out if head_start == 0 else out
+      if part != "attention":
+        x = h.layer_norm(w["mlp_norm"], zeros, self.eps)
+        ff = x.linear(w["Wi"], w.get("bi"))
+        inp, gate = split(ff, 2, axis=-1)
+        h = h + (inp.gelu() * gate).linear(w["Wd"], w.get("bd"))
+    if part != "attention" and stop == self.L: h = h.layer_norm(self.final_w, zeros, self.eps)
+    return compile(h, int8=self.int8)
+
   def _embed(self, ids: np.ndarray) -> np.ndarray:
     """Host-side token + position + type embedding lookup, then LayerNorm."""  # gather is not an ANE op
+    if self.modernbert:
+      e = self.word[ids]
+      m = e.mean(-1, keepdims=True)
+      v = ((e - m) ** 2).mean(-1, keepdims=True)
+      return ((e - m) / np.sqrt(v + self.eps) * self.eln_w).astype(np.float32)
     e = self.word[ids] + self.pos[self.pos_offset + np.arange(len(ids))]
     if self.typ is not None: e = e + self.typ[0]         # MPNet has no token-type embedding
     m = e.mean(-1, keepdims=True)
     v = ((e - m) ** 2).mean(-1, keepdims=True)
     return ((e - m) / np.sqrt(v + self.eps) * self.eln_w + self.eln_b).astype(np.float32)
+
+  def hidden_states(self, input_ids: np.ndarray, attention_mask: np.ndarray) -> np.ndarray:
+    """ModernBERT token states [1,S,D], for heads such as Laya's decision model."""
+    if not self.modernbert:
+      raise ValueError("hidden_states currently requires a ModernBERT encoder")
+    ids, valid = np.asarray(input_ids), np.asarray(attention_mask)
+    if ids.ndim != 2 or ids.shape[0] != 1 or valid.shape != ids.shape:
+      raise ValueError("input_ids and attention_mask must both have shape [1,S]")
+    S = ids.shape[1]
+    net = self._cache.get(S) or self._cache.setdefault(S, self._build(S))
+    mask = np.broadcast_to((1 - valid[0])[None, None, :] * -1e4, (1, S, S)).astype(np.float32)
+    return net(self._embed(ids[0]), mask)[None]
+
+  def release(self) -> None:
+    for net in self._cache.values(): net.release()
+    self._cache.clear()
 
   def __call__(self, texts, normalize: bool = True) -> np.ndarray:
     if isinstance(texts, str): texts = [texts]
